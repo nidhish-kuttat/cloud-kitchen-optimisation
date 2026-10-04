@@ -39,7 +39,10 @@ def calculate_route_distance_km(
                 distance_meters
             )
 
-        except nx.NetworkXNoPath:
+        except (
+            nx.NetworkXNoPath,
+            nx.NodeNotFound
+        ):
 
             pass
 
@@ -146,7 +149,69 @@ def calculate_delay_metrics(
 
 
 # ===================================================
-# EVALUATE OPTIMISED ROUTES
+# BUILD ORDER LOCATION LOOKUP
+# ===================================================
+
+def build_order_location_lookup(
+    optimized_routes
+):
+
+    location_lookup = {}
+
+
+    for vehicle in optimized_routes:
+
+        for stop in vehicle[
+            "route"
+        ]:
+
+            order_id = (
+                stop[
+                    "order_id"
+                ]
+            )
+
+
+            if (
+                order_id
+                == "Restaurant"
+            ):
+
+                continue
+
+
+            location_lookup[
+                int(order_id)
+            ] = {
+
+                "latitude":
+                    float(
+                        stop[
+                            "latitude"
+                        ]
+                    ),
+
+                "longitude":
+                    float(
+                        stop[
+                            "longitude"
+                        ]
+                    ),
+
+                "osm_node":
+                    int(
+                        stop[
+                            "osm_node"
+                        ]
+                    )
+            }
+
+
+    return location_lookup
+
+
+# ===================================================
+# EVALUATE ROUTES
 # ===================================================
 
 def evaluate_optimized_routes(
@@ -276,7 +341,8 @@ def create_baseline_routes(
     location_nodes,
     time_matrix,
     restaurant_lat,
-    restaurant_lon
+    restaurant_lon,
+    optimized_routes
 ):
 
     # ---------------------------------------------------
@@ -291,10 +357,17 @@ def create_baseline_routes(
     # all four -> Vehicle 3
     #
     # Within each vehicle, orders are delivered
-    # in original CSV/order ID sequence.
+    # in original order-ID sequence.
     #
-    # This gives us a simple non-optimised baseline.
+    # This provides a simple non-optimised baseline.
     # ---------------------------------------------------
+
+
+    location_lookup = (
+        build_order_location_lookup(
+            optimized_routes
+        )
+    )
 
 
     west_orders = (
@@ -381,14 +454,21 @@ def create_baseline_routes(
                 "original_deadline":
                     None,
 
+                "ready_time":
+                    0,
+
                 "load":
                     0,
 
                 "latitude":
-                    restaurant_lat,
+                    float(
+                        restaurant_lat
+                    ),
 
                 "longitude":
-                    restaurant_lon,
+                    float(
+                        restaurant_lon
+                    ),
 
                 "osm_node":
                     int(
@@ -401,7 +481,7 @@ def create_baseline_routes(
 
 
         # ---------------------------------------------------
-        # DELIVER ORDERS IN CSV SEQUENCE
+        # DELIVER ORDERS IN ORDER-ID SEQUENCE
         # ---------------------------------------------------
 
         for _, order_row in (
@@ -414,13 +494,6 @@ def create_baseline_routes(
                 ]
             )
 
-
-            # node 0 = restaurant
-            # dataframe row 0 = order 1
-            # so routing node is order_id position
-            #
-            # Use dataframe index lookup instead of
-            # assuming order IDs are always sequential.
 
             matching_indexes = (
                 orders_df.index[
@@ -449,6 +522,32 @@ def create_baseline_routes(
                 + 1
             )
 
+
+            # -----------------------------------------------
+            # GET COORDINATES FROM OPTIMISED ROUTE DATA
+            # -----------------------------------------------
+
+            if (
+                order_id
+                not in location_lookup
+            ):
+
+                raise KeyError(
+                    f"Could not find coordinates "
+                    f"for Order {order_id}"
+                )
+
+
+            customer_location = (
+                location_lookup[
+                    order_id
+                ]
+            )
+
+
+            # -----------------------------------------------
+            # TRAVEL TIME
+            # -----------------------------------------------
 
             travel_time = (
                 time_matrix[
@@ -500,29 +599,30 @@ def create_baseline_routes(
                             ]
                         ),
 
+                    "ready_time":
+                        int(
+                            order_row[
+                                "ready_time"
+                            ]
+                        ),
+
                     "load":
                         current_load,
 
                     "latitude":
-                        float(
-                            order_row[
-                                "latitude"
-                            ]
-                        ),
+                        customer_location[
+                            "latitude"
+                        ],
 
                     "longitude":
-                        float(
-                            order_row[
-                                "longitude"
-                            ]
-                        ),
+                        customer_location[
+                            "longitude"
+                        ],
 
                     "osm_node":
-                        int(
-                            location_nodes[
-                                customer_node
-                            ]
-                        )
+                        customer_location[
+                            "osm_node"
+                        ]
                 }
             )
 
@@ -569,14 +669,21 @@ def create_baseline_routes(
                 "original_deadline":
                     None,
 
+                "ready_time":
+                    0,
+
                 "load":
                     current_load,
 
                 "latitude":
-                    restaurant_lat,
+                    float(
+                        restaurant_lat
+                    ),
 
                 "longitude":
-                    restaurant_lon,
+                    float(
+                        restaurant_lon
+                    ),
 
                 "osm_node":
                     int(
@@ -633,11 +740,23 @@ def compare_routes(
 
     baseline_routes = (
         create_baseline_routes(
-            orders_df,
-            location_nodes,
-            time_matrix,
-            restaurant_lat,
-            restaurant_lon
+            orders_df=
+                orders_df,
+
+            location_nodes=
+                location_nodes,
+
+            time_matrix=
+                time_matrix,
+
+            restaurant_lat=
+                restaurant_lat,
+
+            restaurant_lon=
+                restaurant_lon,
+
+            optimized_routes=
+                optimized_routes
         )
     )
 
