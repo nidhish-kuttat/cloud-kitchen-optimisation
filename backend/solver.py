@@ -53,7 +53,7 @@ MAX_SNAP_DISTANCE_METERS = 350
 FALLBACK_COORDINATES = {
 
     "Vile Parle West, Mumbai, Maharashtra, India":
-        (19.1075, 72.8263),
+        (19.10391, 72.84030),
 
     "Irla, Vile Parle West, Mumbai, Maharashtra, India":
         (19.1085, 72.8372),
