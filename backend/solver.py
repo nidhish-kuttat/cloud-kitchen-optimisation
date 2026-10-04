@@ -1,19 +1,23 @@
 import math
-import pandas as pd
-import osmnx as ox
-import networkx as nx
+import os
 
-from ortools.constraint_solver import routing_enums_pb2
+import networkx as nx
+import osmnx as ox
+import pandas as pd
+
 from ortools.constraint_solver import pywrapcp
+from ortools.constraint_solver import routing_enums_pb2
 
 from .evaluation import compare_routes
 
 
-# ===================================================
+# =========================================================
 # CONFIGURATION
-# ===================================================
+# =========================================================
 
 CSV_PATH = "data/orders.csv"
+
+GRAPH_PATH = "data/mumbai_road_graph.graphml"
 
 RESTAURANT_ADDRESS = (
     "Vile Parle West, Mumbai, Maharashtra, India"
@@ -34,6 +38,7 @@ LOADING_TIME_MIN = 1
 LATE_PENALTY_PER_MINUTE = 1000
 
 DEADLINE_EXTENSION_STEP = 5
+
 MAX_DEADLINE_EXTENSION = 60
 
 MAX_ROUTE_TIME = 300
@@ -41,77 +46,63 @@ MAX_ROUTE_TIME = 300
 MAX_SNAP_DISTANCE_METERS = 350
 
 
-# ===================================================
-# GEOCODING FALLBACKS
-# ===================================================
+# =========================================================
+# FALLBACK COORDINATES
+# =========================================================
 
-GEOCODE_FALLBACKS = {
+FALLBACK_COORDINATES = {
 
-    "Irla, Vile Parle West, Mumbai, Maharashtra, India": [
-        "Irla, Mumbai, Maharashtra, India"
-    ],
+    "Vile Parle West, Mumbai, Maharashtra, India":
+        (19.1075, 72.8263),
 
-    "Juhu Scheme, Mumbai, Maharashtra, India": [
-        "Juhu, Mumbai, Maharashtra, India"
-    ],
+    "Irla, Vile Parle West, Mumbai, Maharashtra, India":
+        (19.1085, 72.8372),
 
-    "DN Nagar, Andheri West, Mumbai, Maharashtra, India": [
-        "D N Nagar, Mumbai, Maharashtra, India",
-        "Andheri West, Mumbai, Maharashtra, India"
-    ],
+    "Juhu Scheme, Mumbai, Maharashtra, India":
+        (19.1123, 72.8261),
 
-    "Four Bungalows, Andheri West, Mumbai, Maharashtra, India": [
-        "Four Bungalows, Mumbai, Maharashtra, India"
-    ],
+    "DN Nagar, Andheri West, Mumbai, Maharashtra, India":
+        (19.1255, 72.8310),
 
-    "Azad Nagar, Andheri West, Mumbai, Maharashtra, India": [
-        "Azad Nagar, Mumbai, Maharashtra, India"
-    ],
+    "Four Bungalows, Andheri West, Mumbai, Maharashtra, India":
+        (19.1306, 72.8249),
 
-    "Versova, Mumbai, Maharashtra, India": [
-        "Versova, Andheri West, Mumbai, Maharashtra, India"
-    ],
+    "Azad Nagar, Andheri West, Mumbai, Maharashtra, India":
+        (19.1279, 72.8373),
 
-    "Lokhandwala Complex, Andheri West, Mumbai, Maharashtra, India": [
-        "Lokhandwala, Andheri West, Mumbai, Maharashtra, India",
-        "Lokhandwala Complex, Mumbai, Maharashtra, India"
-    ],
+    "Versova, Mumbai, Maharashtra, India":
+        (19.1357, 72.8146),
 
-    "Sher E Punjab Colony, Andheri East, Mumbai, Maharashtra, India": [
-        "Sher-E-Punjab Colony, Mumbai, Maharashtra, India",
-        "Sher E Punjab, Mumbai, Maharashtra, India"
-    ],
+    "Lokhandwala Complex, Andheri West, Mumbai, Maharashtra, India":
+        (19.1438, 72.8240),
 
-    "Mahakali Caves Road, Andheri East, Mumbai, Maharashtra, India": [
-        "Mahakali, Andheri East, Mumbai, Maharashtra, India"
-    ],
+    "Sher E Punjab Colony, Andheri East, Mumbai, Maharashtra, India":
+        (19.1260, 72.8662),
 
-    "MIDC, Andheri East, Mumbai, Maharashtra, India": [
-        "Andheri MIDC, Mumbai, Maharashtra, India",
-        "MIDC Andheri, Mumbai, Maharashtra, India"
-    ],
+    "Mahakali Caves Road, Andheri East, Mumbai, Maharashtra, India":
+        (19.1197, 72.8709),
 
-    "SEEPZ, Andheri East, Mumbai, Maharashtra, India": [
-        "SEEPZ, Mumbai, Maharashtra, India"
-    ]
+    "MIDC, Andheri East, Mumbai, Maharashtra, India":
+        (19.1171, 72.8797),
+
+    "SEEPZ, Mumbai, Maharashtra, India":
+        (19.1267, 72.8756)
 }
 
 
-# ===================================================
-# OSMNX SETTINGS
-# ===================================================
-
-ox.settings.use_cache = True
-ox.settings.log_console = False
-
-
-# ===================================================
+# =========================================================
 # LOAD ORDERS
-# ===================================================
+# =========================================================
 
 def load_orders():
 
-    df = pd.read_csv(
+    if not os.path.exists(CSV_PATH):
+
+        raise FileNotFoundError(
+            f"Orders file not found: {CSV_PATH}"
+        )
+
+    orders_df = pd.read_csv(
         CSV_PATH
     )
 
@@ -124,54 +115,79 @@ def load_orders():
         "ready_time"
     ]
 
-    for column in required_columns:
+    missing_columns = [
+        column
+        for column
+        in required_columns
+        if column not in orders_df.columns
+    ]
 
-        if column not in df.columns:
+    if missing_columns:
 
-            raise ValueError(
-                f"Missing required column: {column}"
+        raise ValueError(
+            "Missing required columns: "
+            + ", ".join(missing_columns)
+        )
+
+
+    valid_zones = {
+        "WEST",
+        "EAST"
+    }
+
+    invalid_zones = (
+        set(
+            orders_df["zone"]
+            .astype(str)
+            .str.upper()
+        )
+        - valid_zones
+    )
+
+    if invalid_zones:
+
+        raise ValueError(
+            "Invalid zones found: "
+            + ", ".join(
+                sorted(
+                    invalid_zones
+                )
             )
+        )
 
 
-    df["zone"] = (
-        df["zone"]
+    orders_df["zone"] = (
+        orders_df["zone"]
         .astype(str)
         .str.upper()
-        .str.strip()
     )
 
 
-    invalid_zones = df[
-        ~df["zone"].isin(
-            [
-                "WEST",
-                "EAST"
-            ]
-        )
-    ]
+    total_capacity = sum(
+        VEHICLE_CAPACITIES
+    )
 
+    total_demand = int(
+        orders_df["demand"].sum()
+    )
 
-    if len(
-        invalid_zones
-    ) > 0:
+    if total_demand > total_capacity:
 
         raise ValueError(
-            "Every order zone must be WEST or EAST."
+            f"Total demand {total_demand} exceeds "
+            f"vehicle capacity {total_capacity}"
         )
 
 
-    west_demand = (
-        df[
-            df["zone"]
-            == "WEST"
+    west_demand = int(
+        orders_df[
+            orders_df["zone"] == "WEST"
         ]["demand"].sum()
     )
 
-
-    east_demand = (
-        df[
-            df["zone"]
-            == "EAST"
+    east_demand = int(
+        orders_df[
+            orders_df["zone"] == "EAST"
         ]["demand"].sum()
     )
 
@@ -182,191 +198,66 @@ def load_orders():
         VEHICLE_CAPACITIES[1]
     )
 
-
     east_capacity = (
         VEHICLE_CAPACITIES[2]
     )
 
 
-    if (
-        west_demand
-        >
-        west_capacity
-    ):
+    if west_demand > west_capacity:
 
         raise ValueError(
-            "WEST demand exceeds WEST vehicle capacity."
+            f"WEST demand {west_demand} exceeds "
+            f"WEST vehicle capacity {west_capacity}"
         )
 
 
-    if (
-        east_demand
-        >
-        east_capacity
-    ):
+    if east_demand > east_capacity:
 
         raise ValueError(
-            "EAST demand exceeds EAST vehicle capacity."
+            f"EAST demand {east_demand} exceeds "
+            f"EAST vehicle capacity {east_capacity}"
         )
 
 
-    return df
+    return orders_df
 
 
-# ===================================================
+# =========================================================
 # GEOCODING
-# ===================================================
+# =========================================================
 
-def geocode_address(
-    address
-):
+def geocode_address(address):
 
-    candidates = [
-        address
-    ]
+    if address in FALLBACK_COORDINATES:
+
+        return FALLBACK_COORDINATES[address]
 
 
-    if (
-        address
-        in GEOCODE_FALLBACKS
-    ):
+    try:
 
-        candidates.extend(
-            GEOCODE_FALLBACKS[
+        latitude, longitude = (
+            ox.geocoder.geocode(
                 address
-            ]
+            )
+        )
+
+        return (
+            float(latitude),
+            float(longitude)
         )
 
 
-    last_error = None
+    except Exception as error:
 
-
-    for query in candidates:
-
-        try:
-
-            lat, lon = (
-                ox.geocode(
-                    query
-                )
-            )
-
-            print(
-                f"  ✓ {query}"
-            )
-
-            return (
-                float(lat),
-                float(lon)
-            )
-
-
-        except Exception as error:
-
-            last_error = error
-
-            print(
-                f"  ✗ Could not geocode: {query}"
-            )
-
-
-    raise RuntimeError(
-        "\nCould not geocode location:\n"
-        f"{address}\n\n"
-        f"Last error: {last_error}"
-    )
-
-
-# ===================================================
-# HAVERSINE DISTANCE
-# ===================================================
-
-def haversine_distance_meters(
-    lat1,
-    lon1,
-    lat2,
-    lon2
-):
-
-    radius = 6371000
-
-
-    lat1 = math.radians(
-        lat1
-    )
-
-    lat2 = math.radians(
-        lat2
-    )
-
-
-    dlat = (
-        lat2
-        - lat1
-    )
-
-    dlon = math.radians(
-        lon2
-        - lon1
-    )
-
-
-    a = (
-        math.sin(
-            dlat / 2
-        ) ** 2
-        +
-        math.cos(
-            lat1
+        raise RuntimeError(
+            f"Could not geocode address: {address}. "
+            f"Error: {error}"
         )
-        *
-        math.cos(
-            lat2
-        )
-        *
-        math.sin(
-            dlon / 2
-        ) ** 2
-    )
 
 
-    c = (
-        2
-        *
-        math.atan2(
-            math.sqrt(a),
-            math.sqrt(
-                1 - a
-            )
-        )
-    )
+def geocode_locations(orders_df):
 
-
-    return (
-        radius
-        * c
-    )
-
-
-# ===================================================
-# GEOCODE LOCATIONS
-# ===================================================
-
-def geocode_locations(
-    orders_df
-):
-
-    print(
-        "\n===================================="
-    )
-
-    print(
-        "GEOCODING LOCATIONS"
-    )
-
-    print(
-        "===================================="
-    )
+    locations = []
 
 
     restaurant_lat, restaurant_lon = (
@@ -376,286 +267,196 @@ def geocode_locations(
     )
 
 
-    print(
-        f"\nRestaurant: "
-        f"{restaurant_lat:.6f}, "
-        f"{restaurant_lon:.6f}"
+    locations.append(
+        {
+            "order_id":
+                "Restaurant",
+
+            "address":
+                RESTAURANT_ADDRESS,
+
+            "zone":
+                "DEPOT",
+
+            "deadline":
+                MAX_ROUTE_TIME,
+
+            "ready_time":
+                0,
+
+            "demand":
+                0,
+
+            "latitude":
+                restaurant_lat,
+
+            "longitude":
+                restaurant_lon
+        }
     )
 
 
-    geocoded_orders = (
-        orders_df.copy()
-    )
+    for _, row in orders_df.iterrows():
 
-
-    customer_lats = []
-    customer_lons = []
-
-
-    all_latitudes = [
-        restaurant_lat
-    ]
-
-    all_longitudes = [
-        restaurant_lon
-    ]
-
-
-    for _, row in (
-        geocoded_orders.iterrows()
-    ):
-
-        order_id = int(
-            row[
-                "order_id"
-            ]
-        )
-
-
-        print(
-            f"\nOrder {order_id}:"
-        )
-
-
-        lat, lon = (
+        latitude, longitude = (
             geocode_address(
-                row[
-                    "address"
-                ]
+                row["address"]
             )
         )
 
 
-        customer_lats.append(
-            lat
+        locations.append(
+            {
+                "order_id":
+                    int(
+                        row["order_id"]
+                    ),
+
+                "address":
+                    row["address"],
+
+                "zone":
+                    row["zone"],
+
+                "deadline":
+                    int(
+                        row["deadline"]
+                    ),
+
+                "ready_time":
+                    int(
+                        row["ready_time"]
+                    ),
+
+                "demand":
+                    int(
+                        row["demand"]
+                    ),
+
+                "latitude":
+                    latitude,
+
+                "longitude":
+                    longitude
+            }
         )
 
-        customer_lons.append(
-            lon
+
+    return locations
+
+
+# =========================================================
+# DISTANCE
+# =========================================================
+
+def haversine_distance_meters(
+    lat1,
+    lon1,
+    lat2,
+    lon2
+):
+
+    earth_radius = 6371000
+
+    phi1 = math.radians(
+        lat1
+    )
+
+    phi2 = math.radians(
+        lat2
+    )
+
+    delta_phi = math.radians(
+        lat2 - lat1
+    )
+
+    delta_lambda = math.radians(
+        lon2 - lon1
+    )
+
+
+    a = (
+        math.sin(
+            delta_phi / 2
+        ) ** 2
+        +
+        math.cos(phi1)
+        *
+        math.cos(phi2)
+        *
+        math.sin(
+            delta_lambda / 2
+        ) ** 2
+    )
+
+
+    c = (
+        2
+        *
+        math.atan2(
+            math.sqrt(a),
+            math.sqrt(1 - a)
         )
-
-
-        all_latitudes.append(
-            lat
-        )
-
-        all_longitudes.append(
-            lon
-        )
-
-
-    geocoded_orders[
-        "latitude"
-    ] = customer_lats
-
-
-    geocoded_orders[
-        "longitude"
-    ] = customer_lons
+    )
 
 
     return (
-        geocoded_orders,
-        restaurant_lat,
-        restaurant_lon,
-        all_latitudes,
-        all_longitudes
+        earth_radius
+        *
+        c
     )
 
 
-# ===================================================
-# CREATE ROAD NETWORK
-# ===================================================
+# =========================================================
+# ROAD NETWORK
+# =========================================================
 
-def create_road_network(
-    latitudes,
-    longitudes
-):
+def create_road_network(*args, **kwargs):
 
-    center_lat = (
-        sum(latitudes)
-        /
-        len(latitudes)
-    )
+    if not os.path.exists(
+        GRAPH_PATH
+    ):
 
-
-    center_lon = (
-        sum(longitudes)
-        /
-        len(longitudes)
-    )
-
-
-    max_lat_diff = max(
-        abs(
-            lat
-            - center_lat
+        raise FileNotFoundError(
+            f"Precomputed road graph not found: "
+            f"{GRAPH_PATH}. "
+            f"Run prepare_graph.py locally first."
         )
-        for lat
-        in latitudes
-    )
 
 
-    max_lon_diff = max(
-        abs(
-            lon
-            - center_lon
-        )
-        for lon
-        in longitudes
-    )
-
-
-    approximate_radius = max(
-        max_lat_diff
-        * 111000,
-
-        max_lon_diff
-        * 105000
-    )
-
-
-    graph_radius = max(
-        int(
-            approximate_radius
-            + 2000
-        ),
-        4500
-    )
-
-
-    print(
-        "\n===================================="
-    )
-
-    print(
-        "LOADING OPENSTREETMAP ROAD NETWORK"
-    )
-
-    print(
-        "===================================="
-    )
-
-
-    print(
-        f"Graph radius: "
-        f"{graph_radius} m"
-    )
-
-
-    graph = (
-        ox.graph.graph_from_point(
-            (
-                center_lat,
-                center_lon
-            ),
-            dist=
-                graph_radius,
-            network_type=
-                "drive",
-            simplify=
-                True
-        )
-    )
-
-
-    graph = (
-        ox.routing.add_edge_speeds(
-            graph
-        )
-    )
-
-
-    graph = (
-        ox.routing.add_edge_travel_times(
-            graph
-        )
-    )
-
-
-    print(
-        "Road network ready."
+    graph = ox.load_graphml(
+        GRAPH_PATH
     )
 
 
     return graph
 
 
-# ===================================================
-# SNAP LOCATIONS TO ROAD NETWORK
-# ===================================================
+# =========================================================
+# SNAP LOCATIONS TO OSM
+# =========================================================
 
 def get_location_nodes(
     graph,
-    orders_df,
-    restaurant_lat,
-    restaurant_lon
+    locations
 ):
-
-    print(
-        "\n===================================="
-    )
-
-    print(
-        "VALIDATING ROAD LOCATIONS"
-    )
-
-    print(
-        "===================================="
-    )
-
 
     location_nodes = []
 
 
-    restaurant_node = (
-        ox.distance.nearest_nodes(
-            graph,
-            X=
-                restaurant_lon,
-            Y=
-                restaurant_lat
-        )
-    )
-
-
-    location_nodes.append(
-        restaurant_node
-    )
-
-
-    for _, row in (
-        orders_df.iterrows()
-    ):
-
-        order_id = int(
-            row[
-                "order_id"
-            ]
-        )
-
-
-        latitude = float(
-            row[
-                "latitude"
-            ]
-        )
-
-
-        longitude = float(
-            row[
-                "longitude"
-            ]
-        )
-
+    for location in locations:
 
         nearest_node = (
             ox.distance.nearest_nodes(
                 graph,
                 X=
-                    longitude,
+                    location[
+                        "longitude"
+                    ],
                 Y=
-                    latitude
+                    location[
+                        "latitude"
+                    ]
             )
         )
 
@@ -667,26 +468,29 @@ def get_location_nodes(
         )
 
 
-        snap_distance = (
-            haversine_distance_meters(
-                latitude,
-                longitude,
-                node_data[
-                    "y"
-                ],
-                node_data[
-                    "x"
-                ]
-            )
+        node_lat = float(
+            node_data["y"]
+        )
+
+        node_lon = float(
+            node_data["x"]
         )
 
 
-        print(
-            f"Order "
-            f"{order_id}: "
-            f"{row['zone']} | "
-            f"snap = "
-            f"{snap_distance:.1f} m"
+        snap_distance = (
+            haversine_distance_meters(
+                location[
+                    "latitude"
+                ],
+
+                location[
+                    "longitude"
+                ],
+
+                node_lat,
+
+                node_lon
+            )
         )
 
 
@@ -697,56 +501,44 @@ def get_location_nodes(
         ):
 
             raise ValueError(
-                "\nSuspicious delivery location.\n"
-                f"Order: {order_id}\n"
-                f"Address: {row['address']}\n"
-                f"Road snap distance: "
-                f"{snap_distance:.1f} m"
+                f"Location '{location['address']}' "
+                f"is {snap_distance:.0f} m from "
+                f"nearest drivable road. "
+                f"Maximum allowed is "
+                f"{MAX_SNAP_DISTANCE_METERS} m."
             )
 
 
         location_nodes.append(
-            nearest_node
+            int(
+                nearest_node
+            )
         )
 
 
     return location_nodes
 
 
-# ===================================================
-# RAW OSM TIME MATRIX
-# ===================================================
+# =========================================================
+# RAW ROAD TIME MATRIX
+# =========================================================
 
 def build_raw_time_matrix(
     graph,
     location_nodes
 ):
 
-    print(
-        "\nCalculating OSM road travel times..."
-    )
-
-
-    size = len(
-        location_nodes
-    )
-
-
     matrix = []
 
 
-    for i in range(
-        size
-    ):
+    for source_node in location_nodes:
 
         row = []
 
 
-        for j in range(
-            size
-        ):
+        for target_node in location_nodes:
 
-            if i == j:
+            if source_node == target_node:
 
                 row.append(
                     0
@@ -761,13 +553,9 @@ def build_raw_time_matrix(
                     nx.shortest_path_length(
                         graph,
                         source=
-                            location_nodes[
-                                i
-                            ],
+                            source_node,
                         target=
-                            location_nodes[
-                                j
-                            ],
+                            target_node,
                         weight=
                             "travel_time"
                     )
@@ -776,10 +564,10 @@ def build_raw_time_matrix(
 
                 minutes = max(
                     1,
-                    round(
-                        seconds
-                        /
-                        60
+                    int(
+                        round(
+                            seconds / 60
+                        )
                     )
                 )
 
@@ -792,7 +580,7 @@ def build_raw_time_matrix(
             except nx.NetworkXNoPath:
 
                 row.append(
-                    999
+                    MAX_ROUTE_TIME
                 )
 
 
@@ -801,93 +589,74 @@ def build_raw_time_matrix(
         )
 
 
-    print(
-        "Raw OSM travel-time matrix complete."
-    )
-
-
     return matrix
 
 
-# ===================================================
-# APPLY TRAFFIC FACTOR
-# ===================================================
+# =========================================================
+# TRAFFIC-ADJUSTED TIME MATRIX
+# =========================================================
 
 def apply_traffic_factor(
-    raw_matrix
+    raw_time_matrix
 ):
 
-    adjusted_matrix = []
+    traffic_matrix = []
 
 
-    for i, row in enumerate(
-        raw_matrix
-    ):
+    for row in raw_time_matrix:
 
-        adjusted_row = []
+        traffic_row = []
 
 
-        for j, value in enumerate(
-            row
-        ):
+        for value in row:
 
-            if i == j:
+            if value == 0:
 
-                adjusted_row.append(
+                traffic_row.append(
                     0
                 )
 
-
-            elif value >= 999:
-
-                adjusted_row.append(
-                    999
-                )
-
-
             else:
 
-                adjusted_row.append(
-                    max(
-                        1,
-                        round(
-                            value
-                            *
-                            TRAFFIC_FACTOR
-                        )
+                adjusted = int(
+                    round(
+                        value
+                        *
+                        TRAFFIC_FACTOR
                     )
                 )
 
 
-        adjusted_matrix.append(
-            adjusted_row
+                traffic_row.append(
+                    max(
+                        1,
+                        adjusted
+                    )
+                )
+
+
+        traffic_matrix.append(
+            traffic_row
         )
 
 
-    print(
-        f"Traffic factor applied: "
-        f"{TRAFFIC_FACTOR}"
-    )
+    return traffic_matrix
 
 
-    return adjusted_matrix
-
-
-# ===================================================
-# ATTEMPT VRPTW SOLUTION
-# ===================================================
+# =========================================================
+# OR-TOOLS SOLVER ATTEMPT
+# =========================================================
 
 def attempt_solution(
-    data
+    locations,
+    location_nodes,
+    time_matrix,
+    deadline_extension
 ):
 
     manager = (
         pywrapcp.RoutingIndexManager(
-            len(
-                data[
-                    "time_matrix"
-                ]
-            ),
+            len(locations),
             NUM_VEHICLES,
             0
         )
@@ -901,14 +670,9 @@ def attempt_solution(
     )
 
 
-    solver = (
-        routing.solver()
-    )
-
-
-    # ===================================================
-    # TRAVEL-TIME CALLBACK
-    # ===================================================
+    # -----------------------------------------------------
+    # TIME CALLBACK
+    # -----------------------------------------------------
 
     def time_callback(
         from_index,
@@ -921,7 +685,6 @@ def attempt_solution(
             )
         )
 
-
         to_node = (
             manager.IndexToNode(
                 to_index
@@ -930,9 +693,7 @@ def attempt_solution(
 
 
         travel_time = (
-            data[
-                "time_matrix"
-            ][
+            time_matrix[
                 from_node
             ][
                 to_node
@@ -940,8 +701,6 @@ def attempt_solution(
         )
 
 
-        # Loading takes place before the vehicle
-        # leaves the restaurant.
         if (
             from_node == 0
             and
@@ -953,7 +712,9 @@ def attempt_solution(
             )
 
 
-        return travel_time
+        return int(
+            travel_time
+        )
 
 
     transit_callback_index = (
@@ -968,9 +729,9 @@ def attempt_solution(
     )
 
 
-    # ===================================================
+    # -----------------------------------------------------
     # TIME DIMENSION
-    # ===================================================
+    # -----------------------------------------------------
 
     routing.AddDimension(
         transit_callback_index,
@@ -988,73 +749,55 @@ def attempt_solution(
     )
 
 
-    # ===================================================
-    # CUSTOMER WINDOWS + LATENESS PENALTIES
-    # ===================================================
+    # -----------------------------------------------------
+    # CUSTOMER TIME WINDOWS
+    # -----------------------------------------------------
 
-    for customer_node in range(
+    for location_index in range(
         1,
-        len(
-            data[
-                "time_matrix"
-            ]
-        )
+        len(locations)
     ):
 
         routing_index = (
             manager.NodeToIndex(
-                customer_node
+                location_index
             )
         )
 
 
-        order_row = (
-            data[
-                "orders_df"
-            ].iloc[
-                customer_node
-                - 1
-            ]
-        )
-
-
         ready_time = int(
-            order_row[
+            locations[
+                location_index
+            ][
                 "ready_time"
             ]
         )
 
 
         original_deadline = int(
-            order_row[
+            locations[
+                location_index
+            ][
                 "deadline"
             ]
         )
 
 
-        extended_deadline = int(
+        hard_deadline = (
             original_deadline
             +
-            data[
-                "deadline_extension"
-            ]
+            deadline_extension
         )
 
 
-        # Hard constraint:
-        # order cannot be delivered before it is ready,
-        # and cannot exceed the current extended deadline.
         time_dimension.CumulVar(
             routing_index
         ).SetRange(
             ready_time,
-            extended_deadline
+            hard_deadline
         )
 
 
-        # Soft objective:
-        # every minute after the ORIGINAL deadline
-        # is strongly penalised.
         time_dimension.SetCumulVarSoftUpperBound(
             routing_index,
             original_deadline,
@@ -1062,9 +805,9 @@ def attempt_solution(
         )
 
 
-    # ===================================================
-    # VEHICLE START TIMES
-    # ===================================================
+    # -----------------------------------------------------
+    # VEHICLE START WINDOWS
+    # -----------------------------------------------------
 
     for vehicle_id in range(
         NUM_VEHICLES
@@ -1085,9 +828,9 @@ def attempt_solution(
         )
 
 
-    # ===================================================
-    # CAPACITY
-    # ===================================================
+    # -----------------------------------------------------
+    # CAPACITY CALLBACK
+    # -----------------------------------------------------
 
     def demand_callback(
         from_index
@@ -1100,11 +843,11 @@ def attempt_solution(
         )
 
 
-        return (
-            data[
-                "demands"
-            ][
+        return int(
+            locations[
                 node
+            ][
+                "demand"
             ]
         )
 
@@ -1125,39 +868,28 @@ def attempt_solution(
     )
 
 
-    # ===================================================
+    capacity_dimension = (
+        routing.GetDimensionOrDie(
+            "Capacity"
+        )
+    )
+
+
+    # -----------------------------------------------------
     # ZONE RESTRICTIONS
-    # ===================================================
+    # -----------------------------------------------------
 
-    for customer_node in range(
+    solver = routing.solver()
+
+
+    for location_index in range(
         1,
-        len(
-            data[
-                "time_matrix"
-            ]
-        )
+        len(locations)
     ):
-
-        order_row = (
-            data[
-                "orders_df"
-            ].iloc[
-                customer_node
-                - 1
-            ]
-        )
-
-
-        zone = (
-            order_row[
-                "zone"
-            ]
-        )
-
 
         routing_index = (
             manager.NodeToIndex(
-                customer_node
+                location_index
             )
         )
 
@@ -1166,6 +898,15 @@ def attempt_solution(
             routing.VehicleVar(
                 routing_index
             )
+        )
+
+
+        zone = (
+            locations[
+                location_index
+            ][
+                "zone"
+            ]
         )
 
 
@@ -1185,40 +926,28 @@ def attempt_solution(
             )
 
 
-    # ===================================================
-    # BATCH READY-TIME CONSTRAINTS
-    # ===================================================
+    # -----------------------------------------------------
+    # BATCH READY CONSTRAINTS
+    # -----------------------------------------------------
 
-    for customer_node in range(
+    for location_index in range(
         1,
-        len(
-            data[
-                "time_matrix"
-            ]
-        )
+        len(locations)
     ):
 
-        order_row = (
-            data[
-                "orders_df"
-            ].iloc[
-                customer_node
-                - 1
-            ]
+        routing_index = (
+            manager.NodeToIndex(
+                location_index
+            )
         )
 
 
         ready_time = int(
-            order_row[
+            locations[
+                location_index
+            ][
                 "ready_time"
             ]
-        )
-
-
-        routing_index = (
-            manager.NodeToIndex(
-                customer_node
-            )
         )
 
 
@@ -1248,7 +977,7 @@ def attempt_solution(
             )
 
 
-            start_time = (
+            vehicle_start_time = (
                 time_dimension.CumulVar(
                     start_index
                 )
@@ -1256,7 +985,7 @@ def attempt_solution(
 
 
             solver.Add(
-                start_time
+                vehicle_start_time
                 >=
                 ready_time
                 *
@@ -1264,9 +993,9 @@ def attempt_solution(
             )
 
 
-    # ===================================================
+    # -----------------------------------------------------
     # SEARCH PARAMETERS
-    # ===================================================
+    # -----------------------------------------------------
 
     search_parameters = (
         pywrapcp.DefaultRoutingSearchParameters()
@@ -1287,26 +1016,26 @@ def attempt_solution(
     )
 
 
-    search_parameters.time_limit.seconds = (
-        8
+    search_parameters.time_limit.seconds = 8
+
+
+    # -----------------------------------------------------
+    # SOLVE
+    # -----------------------------------------------------
+
+    solution = routing.SolveWithParameters(
+        search_parameters
     )
 
 
-    solution = (
-        routing.SolveWithParameters(
-            search_parameters
-        )
-    )
-
-
-    if not solution:
+    if solution is None:
 
         return None
 
 
-    # ===================================================
-    # EXTRACT SOLUTION
-    # ===================================================
+    # -----------------------------------------------------
+    # EXTRACT ROUTES
+    # -----------------------------------------------------
 
     routes = []
 
@@ -1315,16 +1044,19 @@ def attempt_solution(
         NUM_VEHICLES
     ):
 
-        index = (
-            routing.Start(
-                vehicle_id
-            )
+        index = routing.Start(
+            vehicle_id
         )
 
 
         vehicle_route = []
 
-        route_load = 0
+
+        assigned_zone = (
+            "EAST"
+            if vehicle_id == 2
+            else "WEST"
+        )
 
 
         while not routing.IsEnd(
@@ -1338,7 +1070,14 @@ def attempt_solution(
             )
 
 
-            arrival = (
+            location = (
+                locations[
+                    node
+                ]
+            )
+
+
+            arrival_time = (
                 solution.Value(
                     time_dimension.CumulVar(
                         index
@@ -1347,149 +1086,74 @@ def attempt_solution(
             )
 
 
-            route_load += (
-                data[
-                    "demands"
-                ][
-                    node
-                ]
+            vehicle_load = (
+                solution.Value(
+                    capacity_dimension.CumulVar(
+                        index
+                    )
+                )
             )
-
-
-            if node == 0:
-
-                order_id = (
-                    "Restaurant"
-                )
-
-                address = (
-                    RESTAURANT_ADDRESS
-                )
-
-                zone = (
-                    "DEPOT"
-                )
-
-                deadline = (
-                    None
-                )
-
-                ready_time = (
-                    None
-                )
-
-                latitude = (
-                    data[
-                        "restaurant_lat"
-                    ]
-                )
-
-                longitude = (
-                    data[
-                        "restaurant_lon"
-                    ]
-                )
-
-
-            else:
-
-                row = (
-                    data[
-                        "orders_df"
-                    ].iloc[
-                        node
-                        - 1
-                    ]
-                )
-
-
-                order_id = int(
-                    row[
-                        "order_id"
-                    ]
-                )
-
-
-                address = (
-                    row[
-                        "address"
-                    ]
-                )
-
-
-                zone = (
-                    row[
-                        "zone"
-                    ]
-                )
-
-
-                deadline = int(
-                    row[
-                        "deadline"
-                    ]
-                )
-
-
-                ready_time = int(
-                    row[
-                        "ready_time"
-                    ]
-                )
-
-
-                latitude = float(
-                    row[
-                        "latitude"
-                    ]
-                )
-
-
-                longitude = float(
-                    row[
-                        "longitude"
-                    ]
-                )
 
 
             vehicle_route.append(
                 {
 
-                    "node":
-                        node,
-
                     "order_id":
-                        order_id,
+                        location[
+                            "order_id"
+                        ],
 
                     "address":
-                        address,
+                        location[
+                            "address"
+                        ],
 
                     "zone":
-                        zone,
+                        location[
+                            "zone"
+                        ],
 
                     "arrival_time":
-                        arrival,
+                        int(
+                            arrival_time
+                        ),
 
                     "original_deadline":
-                        deadline,
+                        int(
+                            location[
+                                "deadline"
+                            ]
+                        ),
 
                     "ready_time":
-                        ready_time,
+                        int(
+                            location[
+                                "ready_time"
+                            ]
+                        ),
 
                     "load":
-                        route_load,
+                        int(
+                            vehicle_load
+                        ),
 
                     "latitude":
-                        latitude,
+                        float(
+                            location[
+                                "latitude"
+                            ]
+                        ),
 
                     "longitude":
-                        longitude,
+                        float(
+                            location[
+                                "longitude"
+                            ]
+                        ),
 
                     "osm_node":
                         int(
-                            data[
-                                "location_nodes"
-                            ][
+                            location_nodes[
                                 node
                             ]
                         )
@@ -1506,9 +1170,32 @@ def attempt_solution(
             )
 
 
-        return_arrival = (
+        end_node = (
+            manager.IndexToNode(
+                index
+            )
+        )
+
+
+        end_location = (
+            locations[
+                end_node
+            ]
+        )
+
+
+        end_arrival_time = (
             solution.Value(
                 time_dimension.CumulVar(
+                    index
+                )
+            )
+        )
+
+
+        end_load = (
+            solution.Value(
+                capacity_dimension.CumulVar(
                     index
                 )
             )
@@ -1518,59 +1205,66 @@ def attempt_solution(
         vehicle_route.append(
             {
 
-                "node":
-                    0,
-
                 "order_id":
-                    "Restaurant",
+                    end_location[
+                        "order_id"
+                    ],
 
                 "address":
-                    RESTAURANT_ADDRESS,
+                    end_location[
+                        "address"
+                    ],
 
                 "zone":
-                    "DEPOT",
+                    end_location[
+                        "zone"
+                    ],
 
                 "arrival_time":
-                    return_arrival,
+                    int(
+                        end_arrival_time
+                    ),
 
                 "original_deadline":
-                    None,
+                    int(
+                        end_location[
+                            "deadline"
+                        ]
+                    ),
 
                 "ready_time":
-                    None,
+                    int(
+                        end_location[
+                            "ready_time"
+                        ]
+                    ),
 
                 "load":
-                    route_load,
+                    int(
+                        end_load
+                    ),
 
                 "latitude":
-                    data[
-                        "restaurant_lat"
-                    ],
+                    float(
+                        end_location[
+                            "latitude"
+                        ]
+                    ),
 
                 "longitude":
-                    data[
-                        "restaurant_lon"
-                    ],
+                    float(
+                        end_location[
+                            "longitude"
+                        ]
+                    ),
 
                 "osm_node":
                     int(
-                        data[
-                            "location_nodes"
-                        ][0]
+                        location_nodes[
+                            end_node
+                        ]
                     )
             }
-        )
-
-
-        assigned_zone = (
-            "WEST"
-            if vehicle_id
-            in [
-                0,
-                1
-            ]
-            else
-            "EAST"
         )
 
 
@@ -1583,11 +1277,6 @@ def attempt_solution(
                 "assigned_zone":
                     assigned_zone,
 
-                "vehicle_capacity":
-                    VEHICLE_CAPACITIES[
-                        vehicle_id
-                    ],
-
                 "route":
                     vehicle_route
             }
@@ -1597,9 +1286,9 @@ def attempt_solution(
     return routes
 
 
-# ===================================================
+# =========================================================
 # PREPARE ENVIRONMENT
-# ===================================================
+# =========================================================
 
 def prepare_environment():
 
@@ -1608,31 +1297,22 @@ def prepare_environment():
     )
 
 
-    (
-        orders_df,
-        restaurant_lat,
-        restaurant_lon,
-        latitudes,
-        longitudes
-    ) = geocode_locations(
-        orders_df
+    locations = (
+        geocode_locations(
+            orders_df
+        )
     )
 
 
     graph = (
-        create_road_network(
-            latitudes,
-            longitudes
-        )
+        create_road_network()
     )
 
 
     location_nodes = (
         get_location_nodes(
             graph,
-            orders_df,
-            restaurant_lat,
-            restaurant_lon
+            locations
         )
     )
 
@@ -1645,7 +1325,7 @@ def prepare_environment():
     )
 
 
-    adjusted_time_matrix = (
+    traffic_time_matrix = (
         apply_traffic_factor(
             raw_time_matrix
         )
@@ -1657,11 +1337,8 @@ def prepare_environment():
         "orders_df":
             orders_df,
 
-        "restaurant_lat":
-            restaurant_lat,
-
-        "restaurant_lon":
-            restaurant_lon,
+        "locations":
+            locations,
 
         "graph":
             graph,
@@ -1673,173 +1350,44 @@ def prepare_environment():
             raw_time_matrix,
 
         "time_matrix":
-            adjusted_time_matrix
+            traffic_time_matrix
     }
 
 
-# ===================================================
-# BUILD SOLVER DATA
-# ===================================================
-
-def build_solver_data(
-    environment,
-    extension
-):
-
-    orders_df = (
-        environment[
-            "orders_df"
-        ]
-    )
-
-
-    time_windows = [
-        (
-            0,
-            MAX_ROUTE_TIME
-        )
-    ]
-
-
-    for _, row in (
-        orders_df.iterrows()
-    ):
-
-        time_windows.append(
-            (
-                int(
-                    row[
-                        "ready_time"
-                    ]
-                ),
-
-                int(
-                    row[
-                        "deadline"
-                    ]
-                )
-                +
-                extension
-            )
-        )
-
-
-    demands = [
-        0
-    ] + [
-        int(
-            demand
-        )
-        for demand
-        in orders_df[
-            "demand"
-        ]
-    ]
-
-
-    return {
-
-        "time_matrix":
-            environment[
-                "time_matrix"
-            ],
-
-        "time_windows":
-            time_windows,
-
-        "demands":
-            demands,
-
-        "orders_df":
-            orders_df,
-
-        "location_nodes":
-            environment[
-                "location_nodes"
-            ],
-
-        "restaurant_lat":
-            environment[
-                "restaurant_lat"
-            ],
-
-        "restaurant_lon":
-            environment[
-                "restaurant_lon"
-            ],
-
-        "deadline_extension":
-            extension
-    }
-
-
-# ===================================================
-# FIND VALID SOLUTION
-# ===================================================
+# =========================================================
+# FIND FEASIBLE SOLUTION
+# =========================================================
 
 def find_solution(
-    environment
+    locations,
+    location_nodes,
+    time_matrix
 ):
 
-    extension = 0
-
-
-    while (
-        extension
-        <=
+    for deadline_extension in range(
+        0,
         MAX_DEADLINE_EXTENSION
+        +
+        DEADLINE_EXTENSION_STEP,
+        DEADLINE_EXTENSION_STEP
     ):
-
-        print(
-            "\n===================================="
-        )
-
-        print(
-            f"TRYING DEADLINE EXTENSION: "
-            f"{extension} MINUTES"
-        )
-
-        print(
-            "===================================="
-        )
-
-
-        data = (
-            build_solver_data(
-                environment,
-                extension
-            )
-        )
-
 
         routes = (
             attempt_solution(
-                data
+                locations,
+                location_nodes,
+                time_matrix,
+                deadline_extension
             )
         )
 
 
         if routes is not None:
 
-            print(
-                "\nVALID SOLUTION FOUND"
-            )
-
-            print(
-                f"Deadline extension used: "
-                f"{extension} minutes"
-            )
-
-
             return (
                 routes,
-                extension
+                deadline_extension
             )
-
-
-        extension += (
-            DEADLINE_EXTENSION_STEP
-        )
 
 
     return (
@@ -1848,64 +1396,21 @@ def find_solution(
     )
 
 
-# ===================================================
-# SOLVE ROUTES ONLY
-# ===================================================
+# =========================================================
+# BUILD SOLVER DATA
+# =========================================================
 
-def solve_vrptw():
-
-    environment = (
-        prepare_environment()
-    )
-
-
-    routes, _ = (
-        find_solution(
-            environment
-        )
-    )
-
-
-    return routes
-
-
-# ===================================================
-# SOLVE + EVALUATE
-# ===================================================
-
-def solve_with_evaluation():
+def build_solver_data():
 
     environment = (
         prepare_environment()
     )
 
 
-    optimized_routes, extension = (
+    routes, deadline_extension = (
         find_solution(
-            environment
-        )
-    )
-
-
-    if (
-        optimized_routes
-        is None
-    ):
-
-        return None
-
-
-    comparison = (
-        compare_routes(
-
             environment[
-                "graph"
-            ],
-
-            optimized_routes,
-
-            environment[
-                "orders_df"
+                "locations"
             ],
 
             environment[
@@ -1914,22 +1419,151 @@ def solve_with_evaluation():
 
             environment[
                 "time_matrix"
-            ],
-
-            environment[
-                "restaurant_lat"
-            ],
-
-            environment[
-                "restaurant_lon"
             ]
         )
     )
 
 
+    if routes is None:
+
+        raise RuntimeError(
+            "No valid routing solution found."
+        )
+
+
+    return {
+
+        **environment,
+
+        "routes":
+            routes,
+
+        "deadline_extension":
+            deadline_extension
+    }
+
+
+# =========================================================
+# PUBLIC SOLVER FUNCTION
+# =========================================================
+
+def solve_vrptw():
+
+    solver_data = (
+        build_solver_data()
+    )
+
+
+    return solver_data[
+        "routes"
+    ]
+
+
+# =========================================================
+# SOLVER + EVALUATION
+# =========================================================
+
+def solve_with_evaluation():
+
+    solver_data = (
+        build_solver_data()
+    )
+
+
+    graph = (
+        solver_data[
+            "graph"
+        ]
+    )
+
+
+    routes = (
+        solver_data[
+            "routes"
+        ]
+    )
+
+
+    orders_df = (
+        solver_data[
+            "orders_df"
+        ]
+    )
+
+
+    location_nodes = (
+        solver_data[
+            "location_nodes"
+        ]
+    )
+
+
+    time_matrix = (
+        solver_data[
+            "time_matrix"
+        ]
+    )
+
+
+    locations = (
+        solver_data[
+            "locations"
+        ]
+    )
+
+
+    restaurant_lat = float(
+        locations[0][
+            "latitude"
+        ]
+    )
+
+
+    restaurant_lon = float(
+        locations[0][
+            "longitude"
+        ]
+    )
+
+
+    comparison = (
+        compare_routes(
+            graph=
+                graph,
+
+            optimized_routes=
+                routes,
+
+            orders_df=
+                orders_df,
+
+            location_nodes=
+                location_nodes,
+
+            time_matrix=
+                time_matrix,
+
+            restaurant_lat=
+                restaurant_lat,
+
+            restaurant_lon=
+                restaurant_lon
+        )
+    )
+
+
+    comparison[
+        "optimized_routes"
+    ] = routes
+
+
     comparison[
         "deadline_extension_used"
-    ] = extension
+    ] = (
+        solver_data[
+            "deadline_extension"
+        ]
+    )
 
 
     comparison[
@@ -1942,39 +1576,25 @@ def solve_with_evaluation():
     return comparison
 
 
-# ===================================================
+# =========================================================
 # PRINT ROUTES
-# ===================================================
+# =========================================================
 
 def print_routes(
     routes
 ):
 
     print(
-        "\n========================================"
-    )
-
-    print(
-        "OPTIMISED DELIVERY ROUTES"
-    )
-
-    print(
-        "========================================"
+        "\nOPTIMISED ROUTES\n"
     )
 
 
     for vehicle in routes:
 
         print(
-            f"\nVehicle "
+            f"Vehicle "
             f"{vehicle['vehicle'] + 1} "
-            f"| Zone: "
-            f"{vehicle['assigned_zone']}"
-        )
-
-
-        print(
-            "-" * 80
+            f"({vehicle['assigned_zone']})"
         )
 
 
@@ -1983,30 +1603,29 @@ def print_routes(
         ]:
 
             print(
-                f"Order: "
-                f"{stop['order_id']} | "
-
-                f"Arrival: "
-                f"{stop['arrival_time']} min | "
-
-                f"Ready: "
-                f"{stop['ready_time']} | "
-
-                f"Deadline: "
-                f"{stop['original_deadline']} | "
-
-                f"Load: "
-                f"{stop['load']}"
+                f"  {stop['order_id']} "
+                f"| arrival={stop['arrival_time']} "
+                f"| deadline={stop['original_deadline']} "
+                f"| ready={stop['ready_time']} "
+                f"| load={stop['load']}"
             )
 
 
-# ===================================================
+        print()
+
+
+# =========================================================
 # PRINT EVALUATION
-# ===================================================
+# =========================================================
 
 def print_evaluation(
     comparison
 ):
+
+    print(
+        "\nBASELINE VS OPTIMISED\n"
+    )
+
 
     baseline = (
         comparison[
@@ -2023,128 +1642,70 @@ def print_evaluation(
 
 
     print(
-        "\n========================================"
+        "Baseline:"
     )
 
-    print(
-        "BASELINE VS OPTIMISED"
-    )
+    for key, value in baseline.items():
 
-    print(
-        "========================================"
-    )
+        print(
+            f"  {key}: {value}"
+        )
 
 
     print(
-        "\nTOTAL DRIVING TIME"
+        "\nOptimised:"
     )
 
-    print(
-        f"Baseline:  "
-        f"{baseline['total_driving_time_min']} min"
-    )
+    for key, value in optimized.items():
 
-    print(
-        f"Optimised: "
-        f"{optimized['total_driving_time_min']} min"
-    )
+        print(
+            f"  {key}: {value}"
+        )
 
 
     print(
-        "\nTOTAL DRIVING DISTANCE"
-    )
-
-    print(
-        f"Baseline:  "
-        f"{baseline['total_driving_distance_km']} km"
-    )
-
-    print(
-        f"Optimised: "
-        f"{optimized['total_driving_distance_km']} km"
+        "\nDeadline extension used:",
+        comparison[
+            "deadline_extension_used"
+        ]
     )
 
 
     print(
-        "\nTOTAL DELAY"
-    )
-
-    print(
-        f"Baseline:  "
-        f"{baseline['total_delay_min']} min"
-    )
-
-    print(
-        f"Optimised: "
-        f"{optimized['total_delay_min']} min"
+        "Traffic factor:",
+        comparison[
+            "traffic_factor"
+        ]
     )
 
 
-    print(
-        "\nORDERS AFTER DEADLINE"
-    )
-
-    print(
-        f"Baseline:  "
-        f"{baseline['late_orders']}"
-    )
-
-    print(
-        f"Optimised: "
-        f"{optimized['late_orders']}"
-    )
-
-
-    print(
-        "\nORDERS >10 MIN LATE"
-    )
-
-    print(
-        f"Baseline:  "
-        f"{baseline['orders_over_10_min_late']}"
-    )
-
-    print(
-        f"Optimised: "
-        f"{optimized['orders_over_10_min_late']}"
-    )
-
-
-    print(
-        "\nDeadline extension used:"
-    )
-
-    print(
-        f"{comparison['deadline_extension_used']} minutes"
-    )
-
-
-# ===================================================
-# DIRECT RUN
-# ===================================================
+# =========================================================
+# DIRECT EXECUTION
+# =========================================================
 
 if __name__ == "__main__":
 
-    comparison = (
-        solve_with_evaluation()
-    )
+    try:
 
-
-    if comparison is None:
-
-        print(
-            "\nNo valid routing solution found."
+        result = (
+            solve_with_evaluation()
         )
 
-    else:
 
         print_routes(
-            comparison[
+            result[
                 "optimized_routes"
             ]
         )
 
 
         print_evaluation(
-            comparison
+            result
+        )
+
+
+    except Exception as error:
+
+        print(
+            f"\nERROR: {error}\n"
         )

@@ -23,6 +23,8 @@ API_URL = os.getenv(
 
 ORDERS_FILE = "data/orders.csv"
 
+GRAPH_FILE = "data/mumbai_road_graph.graphml"
+
 VEHICLE_COLORS = [
     "red",
     "blue",
@@ -576,7 +578,7 @@ if (
 
 
     # ===================================================
-    # ROAD GRAPH
+    # LOAD PRECOMPUTED ROAD GRAPH
     # ===================================================
 
     st.subheader(
@@ -588,96 +590,42 @@ if (
         is None
     ):
 
-        with st.spinner(
-            "Loading OpenStreetMap road network..."
+        if not os.path.exists(
+            GRAPH_FILE
         ):
 
-            latitudes = [
-                point[0]
-                for point
-                in all_coordinates
-            ]
-
-            longitudes = [
-                point[1]
-                for point
-                in all_coordinates
-            ]
-
-            center_lat = (
-                sum(latitudes)
-                / len(latitudes)
+            st.error(
+                f"Road graph file not found: "
+                f"{GRAPH_FILE}"
             )
 
-            center_lon = (
-                sum(longitudes)
-                / len(longitudes)
-            )
+            st.stop()
 
-            max_lat_diff = max(
-                abs(
-                    lat
-                    - center_lat
+
+        with st.spinner(
+            "Loading precomputed road network..."
+        ):
+
+            try:
+
+                graph = (
+                    ox.load_graphml(
+                        GRAPH_FILE
+                    )
                 )
-                for lat
-                in latitudes
-            )
 
-            max_lon_diff = max(
-                abs(
-                    lon
-                    - center_lon
-                )
-                for lon
-                in longitudes
-            )
-
-            approximate_radius = max(
-                max_lat_diff
-                * 111000,
-
-                max_lon_diff
-                * 105000
-            )
-
-            graph_radius = max(
-                int(
-                    approximate_radius
-                    + 2000
-                ),
-                4000
-            )
-
-            graph = (
-                ox.graph.graph_from_point(
-                    (
-                        center_lat,
-                        center_lon
-                    ),
-                    dist=
-                        graph_radius,
-                    network_type=
-                        "drive",
-                    simplify=
-                        True
-                )
-            )
-
-            graph = (
-                ox.routing.add_edge_speeds(
+                st.session_state.road_graph = (
                     graph
                 )
-            )
 
-            graph = (
-                ox.routing.add_edge_travel_times(
-                    graph
+            except Exception as error:
+
+                st.error(
+                    f"Could not load road graph: "
+                    f"{error}"
                 )
-            )
 
-            st.session_state.road_graph = (
-                graph
-            )
+                st.stop()
 
 
     graph = (
@@ -985,7 +933,10 @@ if (
                 )
 
 
-            except nx.NetworkXNoPath:
+            except (
+                nx.NetworkXNoPath,
+                nx.NodeNotFound
+            ):
 
                 pass
 
@@ -1056,7 +1007,7 @@ if (
 
     st.caption(
         "Optimised routes follow "
-        "OpenStreetMap road geometry."
+        "the precomputed OpenStreetMap road network."
     )
 
 
@@ -2169,9 +2120,8 @@ st.write(
     Google OR-Tools determines vehicle assignments and
     delivery sequences.
 
-    OpenStreetMap and OSMnx provide geocoding,
-    road-network travel-time estimates, route geometry
-    and distance calculations.
+    OpenStreetMap and OSMnx provide the precomputed road
+    network, route geometry and distance calculations.
 
     SimPy models order preparation, readiness, vehicle
     loading, dispatch, traffic-adjusted driving,
