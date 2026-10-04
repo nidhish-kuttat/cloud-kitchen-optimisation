@@ -52,3 +52,4 @@ websockets==16.1.1
 xyzservices==2026.9.1
 networkx
 osmnx
+scikit-learn
